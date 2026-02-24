@@ -1,0 +1,563 @@
+"""
+Regulatory Q&A Assistant — POC
+Bank internal policy Q&A using RAG + GitHub Copilot API Gateway (GPT / Gemini)
+
+Run with:  streamlit run app.py
+"""
+
+import os
+import streamlit as st
+from openai import OpenAI
+
+from synthetic_policies import DOCUMENTS
+from rag_engine import RAGEngine, build_prompt
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+# GitHub Copilot API Gateway — OpenAI-compatible endpoint
+COPILOT_BASE_URL = "https://api.githubcopilot.com"
+
+# Models available via GitHub Copilot (add/remove as your gateway allows)
+AVAILABLE_MODELS = {
+    "GPT-4o"          : "gpt-4o",
+    "GPT-4o Mini"     : "gpt-4o-mini",
+    "Gemini 2.5 Pro"  : "gemini-2.5-pro",
+    "o3-mini"         : "o3-mini",
+}
+
+TOP_K_CHUNKS = 5   # number of policy chunks to retrieve per query
+
+# ─────────────────────────────────────────────
+# PAGE SETUP
+# ─────────────────────────────────────────────
+
+st.set_page_config(
+    page_title = "Regulatory Q&A Assistant",
+    page_icon  = "🏦",
+    layout     = "wide",
+)
+
+st.title("🏦 Regulatory Policy Q&A Assistant")
+st.caption("Internal use only · Powered by RAG + GitHub Copilot API · Synthetic data POC")
+
+# ─────────────────────────────────────────────
+# SIDEBAR — CONFIG
+# ─────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("⚙️ Configuration")
+
+    github_token = st.text_input(
+        "GitHub Token",
+        type     = "password",
+        value    = os.environ.get("GITHUB_TOKEN", ""),
+        help     = "Your GitHub PAT with Copilot access. Set GITHUB_TOKEN env var to avoid pasting each time.",
+    )
+
+    selected_model_label = st.selectbox(
+        "LLM Model",
+        options = list(AVAILABLE_MODELS.keys()),
+        index   = 0,
+        help    = "All models routed via GitHub Copilot API Gateway",
+    )
+    selected_model = AVAILABLE_MODELS[selected_model_label]
+
+    top_k = st.slider(
+        "Chunks to retrieve (top-k)",
+        min_value = 1, max_value = 10, value = TOP_K_CHUNKS,
+        help = "More chunks = more context but longer prompts",
+    )
+
+    temperature = st.slider(
+        "Temperature",
+        min_value = 0.0, max_value = 1.0, value = 0.2, step = 0.05,
+        help = "Lower = more factual and deterministic",
+    )
+
+    st.divider()
+    st.subheader("📄 Loaded Policy Documents")
+    for doc in DOCUMENTS:
+        st.markdown(f"- **{doc['id']}**: {doc['title']}")
+
+    st.divider()
+    st.info(
+        "**Data stays local.**\n\n"
+        "Embeddings and retrieval run on your machine. "
+        "Only the retrieved policy excerpts + your question are sent to the LLM."
+    )
+
+# ─────────────────────────────────────────────
+# BUILD RAG INDEX (cached so it only runs once per session)
+# ─────────────────────────────────────────────
+
+@st.cache_resource(show_spinner="Building policy index (one-time)...")
+def get_rag_engine():
+    engine = RAGEngine()
+    engine.build_index(DOCUMENTS)
+    return engine
+
+engine = get_rag_engine()
+
+# ─────────────────────────────────────────────
+# CHAT HISTORY
+# ─────────────────────────────────────────────
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display past messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg.get("sources"):
+            with st.expander("📎 Retrieved policy sources", expanded=False):
+                for src in msg["sources"]:
+                    st.markdown(
+                        f"**[{src['doc_id']}] {src['doc_title']}** "
+                        f"_(relevance: {src['score']:.2f})_\n\n> {src['text'][:300]}..."
+                    )
+
+# ─────────────────────────────────────────────
+# QUERY INPUT
+# ─────────────────────────────────────────────
+
+query = st.chat_input("Ask a regulatory or policy question...")
+
+if query:
+    if not github_token:
+        st.error("Please enter your GitHub Token in the sidebar to proceed.")
+        st.stop()
+
+    # Show user message
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    # Retrieve relevant chunks
+    with st.spinner("Searching policy documents..."):
+        retrieved = engine.retrieve(query, top_k=top_k)
+
+    # Build RAG prompt
+    rag_prompt = build_prompt(query, retrieved)
+
+    # Call LLM via GitHub Copilot API Gateway
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        full_response = ""
+
+        try:
+            client = OpenAI(
+                api_key  = github_token,
+                base_url = COPILOT_BASE_URL,
+                default_headers = {
+                    "Editor-Version"       : "vscode/1.85.0",
+                    "Editor-Plugin-Version": "copilot-chat/0.12.0",
+                    "Copilot-Integration-Id": "vscode-chat",
+                },
+            )
+
+            stream = client.chat.completions.create(
+                model       = selected_model,
+                temperature = temperature,
+                stream      = True,
+                messages    = [
+                    {
+                        "role"   : "system",
+                        "content": (
+                            "You are a precise regulatory compliance assistant for a bank. "
+                            "Answer only from the provided policy excerpts. "
+                            "Be professional and cite sources."
+                        ),
+                    },
+                    {"role": "user", "content": rag_prompt},
+                ],
+            )
+
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                full_response += delta
+                response_placeholder.markdown(full_response + "▌")
+
+            response_placeholder.markdown(full_response)
+
+            # Show sources inline
+            with st.expander("📎 Retrieved policy sources", expanded=False):
+                for i, src in enumerate(retrieved, 1):
+                    st.markdown(
+                        f"**[Source {i}] [{src['doc_id']}] {src['doc_title']}** "
+                        f"_(relevance: {src['score']:.2f})_"
+                    )
+                    st.markdown(f"> {src['text'][:400]}...")
+                    st.divider()
+
+            # Show model used
+            st.caption(f"Model: {selected_model_label} · Chunks retrieved: {len(retrieved)}")
+
+        except Exception as e:
+            full_response = f"❌ Error calling LLM: {str(e)}"
+            response_placeholder.error(full_response)
+
+    # Save to history
+    st.session_state.messages.append({
+        "role"   : "assistant",
+        "content": full_response,
+        "sources": retrieved,
+    })
+
+# ─────────────────────────────────────────────
+# SAMPLE QUESTIONS (shown when chat is empty)
+# ─────────────────────────────────────────────
+
+if not st.session_state.messages:
+    st.divider()
+    st.subheader("💡 Try asking...")
+    sample_questions = [
+        "What CIBIL score is required for a home loan?",
+        "When must an STR be filed with FIU-IND?",
+        "What documents are needed for KYC of a corporate customer?",
+        "What happens if a customer doesn't complete Re-KYC?",
+        "Can customer data be used for AI model training?",
+        "Who approves loans above INR 1 crore?",
+        "What is the zero liability policy for fraud?",
+    ]
+    cols = st.columns(2)
+    for i, q in enumerate(sample_questions):
+        with cols[i % 2]:
+            st.markdown(f"- *{q}*")
+
+----------------------------------------------------------------------------------------------
+
+"""
+RAG Engine - handles document chunking, embedding and retrieval.
+Runs entirely locally (no data sent externally during indexing).
+"""
+
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Tuple
+
+
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # small, fast, good quality — downloads once, runs locally
+CHUNK_SIZE      = 400   # characters per chunk (tweak based on your doc structure)
+CHUNK_OVERLAP   = 80    # overlap to avoid cutting context at chunk boundaries
+
+
+def chunk_document(doc: Dict, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:
+    """Split a document into overlapping text chunks."""
+    text    = doc["content"].strip()
+    chunks  = []
+    start   = 0
+
+    while start < len(text):
+        end   = min(start + chunk_size, len(text))
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append({
+                "doc_id"   : doc["id"],
+                "doc_title": doc["title"],
+                "chunk_id" : f"{doc['id']}_chunk_{len(chunks)}",
+                "text"     : chunk,
+            })
+
+        start += chunk_size - overlap
+
+    return chunks
+
+
+class RAGEngine:
+    def __init__(self):
+        self.embedder  = None
+        self.index     = None
+        self.chunks    : List[Dict] = []
+        self.dimension : int        = 0
+
+    def build_index(self, documents: List[Dict]) -> int:
+        """Chunk all documents, embed them, and build a FAISS index. Returns chunk count."""
+        print("Loading embedding model (first run downloads ~80MB)...")
+        self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+        # Chunk all docs
+        all_chunks = []
+        for doc in documents:
+            all_chunks.extend(chunk_document(doc))
+        self.chunks = all_chunks
+
+        # Embed
+        print(f"Embedding {len(all_chunks)} chunks...")
+        texts      = [c["text"] for c in all_chunks]
+        embeddings = self.embedder.encode(texts, show_progress_bar=False)
+        embeddings = np.array(embeddings, dtype="float32")
+
+        # Normalise for cosine similarity via inner product
+        faiss.normalize_L2(embeddings)
+
+        # Build FAISS flat index (exact search — fast enough for small corpora)
+        self.dimension = embeddings.shape[1]
+        self.index     = faiss.IndexFlatIP(self.dimension)
+        self.index.add(embeddings)
+
+        print(f"Index built: {self.index.ntotal} chunks across {len(documents)} documents.")
+        return len(all_chunks)
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
+        """Embed a query and retrieve the top_k most relevant chunks."""
+        if self.index is None or self.embedder is None:
+            raise RuntimeError("Index not built. Call build_index() first.")
+
+        query_vec = self.embedder.encode([query], show_progress_bar=False)
+        query_vec = np.array(query_vec, dtype="float32")
+        faiss.normalize_L2(query_vec)
+
+        scores, indices = self.index.search(query_vec, top_k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            chunk = self.chunks[idx].copy()
+            chunk["score"] = float(score)
+            results.append(chunk)
+
+        return results
+
+
+def build_prompt(query: str, retrieved_chunks: List[Dict]) -> str:
+    """Construct the RAG prompt — keeps system instructions clean and cited."""
+    context_blocks = []
+    for i, chunk in enumerate(retrieved_chunks, 1):
+        context_blocks.append(
+            f"[Source {i} — {chunk['doc_title']} ({chunk['doc_id']})]:\n{chunk['text']}"
+        )
+    context = "\n\n".join(context_blocks)
+
+    prompt = f"""You are a knowledgeable regulatory compliance assistant for a bank.
+Answer the question below using ONLY the policy excerpts provided.
+If the answer is not found in the excerpts, say "This information is not covered in the available policy documents."
+Always cite the Source number (e.g. [Source 1]) when referencing policy content.
+Be precise, professional, and concise.
+
+--- POLICY EXCERPTS ---
+{context}
+-----------------------
+
+Question: {query}
+
+Answer:"""
+    return prompt
+
+
+-------------------------------------------------------------------
+
+
+"""
+Synthetic regulatory and policy documents for POC.
+Replace these with your actual internal policy documents in production.
+"""
+
+DOCUMENTS = [
+    {
+        "id": "KYC-001",
+        "title": "Know Your Customer (KYC) Policy",
+        "content": """
+KYC POLICY - INTERNAL DOCUMENT v3.2
+
+1. PURPOSE
+The Bank shall verify the identity of all customers before onboarding to prevent money laundering,
+terrorist financing, and financial fraud. This policy applies to all retail, corporate, and NRI accounts.
+
+2. CUSTOMER IDENTIFICATION REQUIREMENTS
+All individual customers must provide:
+- Government-issued photo ID (Aadhaar, PAN, Passport, or Voter ID)
+- Proof of address not older than 3 months (utility bill, bank statement, or rent agreement)
+- Recent passport-sized photograph
+- Mobile number linked to Aadhaar for OTP-based verification
+
+For corporate entities, the following are additionally required:
+- Certificate of Incorporation
+- Memorandum and Articles of Association
+- Board resolution authorising the account opening
+- List of beneficial owners holding more than 25% stake
+
+3. RE-KYC REQUIREMENTS
+Existing customers must complete Re-KYC every 2 years for high-risk customers,
+every 5 years for medium-risk customers, and every 10 years for low-risk customers.
+Failure to complete Re-KYC will result in account freezing after 30 days notice.
+
+4. RISK CATEGORISATION
+Customers are classified as High, Medium, or Low risk based on:
+- Geography of residence (FATF high-risk countries = High)
+- Transaction volumes and patterns
+- Source of funds declaration
+- Politically Exposed Person (PEP) status
+
+5. ENHANCED DUE DILIGENCE (EDD)
+High-risk customers require EDD which includes:
+- Source of wealth documentation
+- Senior management approval for account opening
+- Quarterly transaction monitoring reviews
+- Face-to-face verification mandatory (video KYC not accepted for High Risk)
+"""
+    },
+    {
+        "id": "AML-002",
+        "title": "Anti-Money Laundering (AML) Guidelines",
+        "content": """
+ANTI-MONEY LAUNDERING GUIDELINES v2.1
+
+1. OVERVIEW
+The Bank is committed to full compliance with the Prevention of Money Laundering Act (PMLA) 2002
+and all subsequent amendments. All staff are responsible for identifying and reporting suspicious activity.
+
+2. SUSPICIOUS TRANSACTION REPORTING (STR)
+A Suspicious Transaction Report (STR) must be filed with the Financial Intelligence Unit - India (FIU-IND)
+within 7 working days of the transaction being identified as suspicious.
+Suspicious indicators include but are not limited to:
+- Cash deposits above INR 10 lakhs in a single transaction
+- Multiple cash deposits just below the reporting threshold (structuring)
+- Transactions inconsistent with the customer's declared business profile
+- Sudden large credits followed by immediate withdrawals
+- Transactions involving countries on FATF blacklist or greylist
+
+3. CASH TRANSACTION REPORTS (CTR)
+All cash transactions above INR 10 lakhs must be reported to FIU-IND via CTR
+within 15 days of the end of the month in which the transaction occurred.
+This includes both single transactions and aggregated transactions from the same customer
+within a calendar month.
+
+4. STAFF OBLIGATIONS
+- All staff must complete AML training annually
+- Tipping off a customer that an STR has been filed is a criminal offence
+- Non-compliance by staff will result in disciplinary action up to and including termination
+- The Money Laundering Reporting Officer (MLRO) must be notified of any suspicious activity within 24 hours
+
+5. RECORD KEEPING
+All KYC documents and transaction records must be retained for a minimum of 5 years
+from the date of account closure or the date of the last transaction, whichever is later.
+"""
+    },
+    {
+        "id": "LENDING-003",
+        "title": "Retail Lending Credit Policy",
+        "content": """
+RETAIL LENDING CREDIT POLICY v5.0
+
+1. ELIGIBILITY CRITERIA - PERSONAL LOANS
+Minimum eligibility requirements for personal loan applicants:
+- Age: 21 to 65 years at loan maturity
+- Minimum net monthly income: INR 25,000 for salaried; INR 40,000 for self-employed
+- Minimum CIBIL score: 700 (applicants below 650 are automatically declined)
+- Minimum employment tenure: 1 year with current employer (salaried); 3 years in business (self-employed)
+- Maximum Debt-to-Income (DTI) ratio: 50% including the proposed EMI
+
+2. LOAN PARAMETERS - PERSONAL LOANS
+- Minimum loan amount: INR 50,000
+- Maximum loan amount: INR 40,00,000 (subject to income and DTI assessment)
+- Tenure: 12 to 84 months
+- Interest rate: Based on risk-based pricing model, currently 10.5% to 18% per annum
+- Processing fee: 1% to 2% of loan amount plus applicable GST
+
+3. HOME LOANS
+- Loan-to-Value (LTV) ratio: Maximum 80% for loans above INR 30 lakhs; 85% for loans up to INR 30 lakhs; 90% for loans up to INR 20 lakhs
+- Maximum tenure: 30 years
+- Mandatory property insurance for the loan tenure
+- Minimum CIBIL score: 720
+- Pre-payment charges: Nil for floating rate loans; 2% for fixed rate loans
+
+4. CREDIT DECISION AUTHORITY
+- Branch Manager: Up to INR 5 lakhs
+- Regional Credit Manager: INR 5 lakhs to INR 25 lakhs
+- Zonal Credit Committee: INR 25 lakhs to INR 1 crore
+- Central Credit Committee: Above INR 1 crore
+
+5. DELINQUENCY AND NPA CLASSIFICATION
+- Special Mention Account (SMA-0): Overdue 1-30 days
+- SMA-1: Overdue 31-60 days
+- SMA-2: Overdue 61-90 days
+- Non-Performing Asset (NPA): Overdue beyond 90 days
+NPA accounts must be referred to the Recovery team within 5 working days of classification.
+"""
+    },
+    {
+        "id": "DATA-004",
+        "title": "Data Privacy and Information Security Policy",
+        "content": """
+DATA PRIVACY AND INFORMATION SECURITY POLICY v4.0
+
+1. SCOPE
+This policy applies to all employees, contractors, and third-party vendors who handle
+customer data or internal bank data. Violations are subject to disciplinary action and
+may result in legal proceedings under the Digital Personal Data Protection Act 2023 (DPDP Act).
+
+2. DATA CLASSIFICATION
+All data must be classified into one of four categories:
+- Public: Information approved for public release (e.g., annual reports, product brochures)
+- Internal: General internal communications and non-sensitive operational data
+- Confidential: Customer personal data, financial data, HR records (encryption mandatory at rest and in transit)
+- Restricted: Encryption keys, regulatory filings, Board minutes (access on need-to-know basis only, dual authorisation required)
+
+3. CUSTOMER DATA HANDLING
+- Customer PII (name, address, phone, account number) must never be stored in unencrypted form
+- Customer data must not be downloaded to personal devices under any circumstances
+- Sharing customer data with third parties requires a Data Processing Agreement (DPA) and CISO approval
+- Customer data must not be used for model training or AI experimentation without explicit consent and legal approval
+- Any data breach involving customer PII must be reported to the CISO within 2 hours of discovery
+
+4. AI AND GENERATIVE AI USAGE
+- Only approved AI tools listed on the Internal AI Approved Tools Register may be used with bank data
+- No customer data or confidential data may be entered into external AI systems including public LLM interfaces
+- Synthetic or anonymised data approved by the Data Governance team may be used for AI development and testing
+- All AI tools used by the bank must undergo a Privacy Impact Assessment (PIA) before deployment
+
+5. ACCESS CONTROL
+- All systems access follows the Principle of Least Privilege
+- Privileged access requires Multi-Factor Authentication (MFA)
+- Access reviews are conducted quarterly for all system administrators
+- Terminated employees' access must be revoked within 4 hours of termination
+"""
+    },
+    {
+        "id": "FRAUD-005",
+        "title": "Fraud Risk Management Framework",
+        "content": """
+FRAUD RISK MANAGEMENT FRAMEWORK v2.3
+
+1. FRAUD TYPES COVERED
+This framework covers the following fraud categories:
+- Internal fraud: Employee misappropriation, unauthorised transactions, data theft
+- External fraud: Phishing, card skimming, account takeover, cheque fraud
+- Cyber fraud: Business Email Compromise (BEC), ransomware, social engineering
+- Identity fraud: Impersonation during account opening or loan application
+
+2. FRAUD DETECTION AND MONITORING
+The Bank operates a 24x7 Transaction Monitoring System (TMS) that flags:
+- Card transactions above INR 50,000 at unusual hours (11 PM - 6 AM)
+- More than 3 failed PIN attempts triggering temporary card block
+- Transactions from IP addresses or devices not previously associated with the account
+- International transactions from countries flagged as high-risk
+All flagged transactions are reviewed by the Fraud Operations team within 1 hour.
+
+3. CUSTOMER NOTIFICATION
+- Customers must be notified of any suspicious transaction via SMS and email within 15 minutes
+- Customers have the right to raise a fraud dispute within 90 days of the transaction date
+- Zero liability for customer if fraud reported within 3 working days (per RBI guidelines)
+- Partial liability applies if reported between 4-7 working days
+
+4. FRAUD INCIDENT RESPONSE
+Upon confirmed fraud:
+- Immediate account freeze to prevent further losses
+- FIR must be filed with cybercrime cell within 24 hours for cyber frauds above INR 1 lakh
+- Customer must receive provisional credit within 10 working days pending investigation
+- Root cause analysis (RCA) must be completed within 30 days
+
+5. STAFF REPORTING
+Employees who suspect internal fraud must report to the Vigilance Department directly.
+Reporting to line manager is not sufficient if the manager may be involved.
+Whistleblower protections apply under the Bank's Whistleblower Policy (REF: HR-WB-001).
+Deliberate non-reporting of known fraud is itself a disciplinary offence.
+"""
+    },
+]
